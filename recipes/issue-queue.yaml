@@ -1,0 +1,258 @@
+# =============================================================================
+# issue-queue.yaml - Process issue queue sequentially with dynamic unblocking
+# =============================================================================
+#
+# Processes ready issues one at a time, each in a fresh agent sub-session.
+# Uses a while loop (not foreach) so completing issue N can dynamically
+# unblock issue N+5 -- get_ready is re-queried every iteration.
+#
+# You provide your work instructions once. The recipe fetches each issue
+# and appends its details (ID, title, description) to the end of your
+# prompt before handing it to the agent.
+#
+# Context variables:
+#   issue_prompt (REQUIRED): Your work instructions that apply to every issue.
+#     The recipe appends the issue details automatically -- you do NOT need
+#     to include issue IDs or placeholders in your prompt.
+#   max_issues (optional, default "50"): Safety cap on issues to process.
+#   issue_agent (optional, default "self"): Agent for the main work step.
+#     "self" uses the calling session's agent configuration.
+#
+# Usage (conversational):
+#   Run the issue-queue recipe with issue_prompt="Read the plan docs.
+#   Implement the issue, test, commit, push, close it, and summarize."
+#
+# Usage (CLI):
+#   amplifier tool invoke recipes operation=execute \
+#     recipe_path=@issues:recipes/issue-queue.yaml \
+#     context='{"issue_prompt": "Read the plan. Implement, test, commit, push, close the issue."}'
+#
+# Stages:
+#   1. planning   - Shows ready issues, requires human approval
+#   2. execution  - While loop processing issues sequentially
+#   3. summary    - Reports results across the run
+#
+# =============================================================================
+
+name: "issue-queue"
+description: "Process issue queue sequentially, each issue in a fresh agent sub-session with dynamic dependency resolution"
+version: "1.1.0"
+tags: ["issues", "automation", "queue", "workflow"]
+
+context:
+  issue_prompt: ""        # REQUIRED: Work instructions applied to every issue.
+  max_issues: "50"        # Safety cap on number of issues to process per run.
+  issue_agent: "self"     # Agent for the main work step.
+  # -- Internal state (managed by the recipe, do not set manually) --
+  has_ready_issues: "true"
+  issues_processed: "0"
+
+stages:
+  # ===========================================================================
+  # Stage 1: Planning -- Show ready issues, get human approval before execution
+  # ===========================================================================
+  - name: "planning"
+    steps:
+      - id: "show-ready-issues"
+        agent: "foundation:zen-architect"
+        prompt: |
+          Use the issue_manager tool with operation "get_ready" to fetch all issues
+          that have their dependencies resolved and are ready to work on.
+
+          Present the results as a clear numbered list showing for each issue:
+          - Issue ID (full)
+          - Title
+          - Priority level
+
+          End with the total count of ready issues.
+          If no issues are ready, state that clearly.
+        output: "ready_issues_summary"
+        timeout: 120
+
+    approval:
+      required: true
+      prompt: |
+        Issue Queue -- Ready Issues:
+
+        {{ready_issues_summary}}
+
+        This recipe will process up to {{max_issues}} issues sequentially.
+        Each issue gets a fresh agent session with your work instructions.
+        Completing issues may dynamically unblock dependent issues.
+
+        Approve to begin processing.
+      timeout: 0
+      default: "deny"
+
+  # ===========================================================================
+  # Stage 2: Execution -- While loop processing one issue per iteration
+  # ===========================================================================
+  - name: "execution"
+    steps:
+      - id: "process-queue"
+        type: "bash"
+        command: "true"
+        while_condition: "{{has_ready_issues}} == 'true' and {{issues_processed}} < {{max_issues}}"
+        max_while_iterations: 200
+        on_error: "continue"
+
+        while_steps:
+          # -----------------------------------------------------------------
+          # 2.1  Fetch the next ready issue from the queue
+          # -----------------------------------------------------------------
+          - id: "fetch-next-issue"
+            agent: "foundation:zen-architect"
+            prompt: |
+              Use the issue_manager tool with:
+              - operation: "get_ready"
+              - params: {"limit": 1}
+
+              Examine the result carefully.
+
+              If at least one issue is returned, respond with ONLY this JSON
+              (no markdown fences, no extra text):
+              {"has_issues": "true", "id": "<full issue ID>", "title": "<issue title>", "description": "<issue description or empty string if none>"}
+
+              If no issues are ready, respond with ONLY:
+              {"has_issues": "false", "id": "", "title": "", "description": ""}
+            output: "next_issue"
+            parse_json: true
+            timeout: 120
+
+          # -----------------------------------------------------------------
+          # 2.2  Build the work prompt: user's instructions + issue details
+          #      The user's prompt is their general work instructions.
+          #      We append the specific issue to work on at the end.
+          # -----------------------------------------------------------------
+          - id: "build-work-prompt"
+            type: "bash"
+            condition: "{{next_issue.has_issues}} == 'true'"
+            command: |
+              python3 << 'PYEOF'
+              import os, sys
+
+              prompt = os.environ.get("ISSUE_PROMPT", "")
+              iid = os.environ.get("ISSUE_ID", "")
+              ititle = os.environ.get("ISSUE_TITLE", "")
+              idesc = os.environ.get("ISSUE_DESC", "")
+
+              # Combine: user's work instructions + issue details
+              parts = [prompt.rstrip()]
+              parts.append("")
+              parts.append("---")
+              parts.append("")
+              parts.append("The next issue to work on:")
+              parts.append(f"  Issue ID: {iid}")
+              parts.append(f"  Title: {ititle}")
+              if idesc:
+                  parts.append(f"  Description: {idesc}")
+
+              sys.stdout.write("\n".join(parts))
+              PYEOF
+            env:
+              ISSUE_PROMPT: "{{issue_prompt}}"
+              ISSUE_ID: "{{next_issue.id}}"
+              ISSUE_TITLE: "{{next_issue.title}}"
+              ISSUE_DESC: "{{next_issue.description}}"
+            output: "work_prompt"
+
+          # -----------------------------------------------------------------
+          # 2.3  Mark the issue as in_progress before handing to the agent
+          # -----------------------------------------------------------------
+          - id: "mark-in-progress"
+            condition: "{{next_issue.has_issues}} == 'true'"
+            agent: "foundation:zen-architect"
+            prompt: |
+              Use the issue_manager tool with:
+              - operation: "update"
+              - params: {"issue_id": "{{next_issue.id}}", "status": "in_progress"}
+
+              Confirm the update. Respond briefly.
+            output: "progress_update"
+            timeout: 60
+            on_error: "continue"
+
+          # -----------------------------------------------------------------
+          # 2.4  Main work -- fresh sub-session processes the issue
+          #      The agent receives: user instructions + issue details
+          # -----------------------------------------------------------------
+          - id: "work-on-issue"
+            condition: "{{next_issue.has_issues}} == 'true'"
+            agent: "{{issue_agent}}"
+            prompt: "{{work_prompt}}"
+            output: "work_result"
+            timeout: 1800
+            on_error: "continue"
+
+          # -----------------------------------------------------------------
+          # 2.5  Post-work verification: did the agent close the issue?
+          #      If still in_progress, revert to open so it doesn't jam.
+          # -----------------------------------------------------------------
+          - id: "post-work-check"
+            condition: "{{next_issue.has_issues}} == 'true'"
+            agent: "foundation:zen-architect"
+            prompt: |
+              Check the current status of issue {{next_issue.id}}.
+
+              Use the issue_manager tool with:
+              - operation: "get"
+              - params: {"issue_id": "{{next_issue.id}}"}
+
+              If status is "closed" or "completed":
+                Respond: "COMPLETED"
+
+              If status is still "in_progress":
+                The work step failed or didn't finish. Revert it:
+                Use issue_manager with:
+                - operation: "update"
+                - params: {"issue_id": "{{next_issue.id}}", "status": "open", "blocking_notes": "Automated processing incomplete - needs manual review"}
+                Respond: "REVERTED"
+
+              For any other status, respond with what you find.
+            output: "check_result"
+            timeout: 120
+            on_error: "continue"
+
+          # -----------------------------------------------------------------
+          # 2.6  Increment processed counter
+          # -----------------------------------------------------------------
+          - id: "update-counter"
+            type: "bash"
+            command: |
+              if [ "{{next_issue.has_issues}}" = "true" ]; then
+                echo "$(({{issues_processed}} + 1))"
+              else
+                echo "{{issues_processed}}"
+              fi
+            output: "new_count"
+
+        # -- After each iteration, update loop-control variables --
+        update_context:
+          has_ready_issues: "{{next_issue.has_issues}}"
+          issues_processed: "{{new_count}}"
+
+        # -- Exit immediately when no more issues are ready --
+        break_when: "{{next_issue.has_issues}} != 'true'"
+
+  # ===========================================================================
+  # Stage 3: Summary -- Report what happened across the run
+  # ===========================================================================
+  - name: "summary"
+    steps:
+      - id: "generate-summary"
+        agent: "foundation:zen-architect"
+        prompt: |
+          Generate a summary report of the issue queue processing run.
+
+          Use the issue_manager tool with operation "list" to get all issues.
+
+          Report:
+          1. Total issues processed this run: {{issues_processed}}
+          2. Issues by current status (closed, open, in_progress, blocked)
+          3. Any issues reverted to open (failures needing manual review)
+          4. Any issues newly unblocked by completed work
+          5. Remaining ready issues (could be processed in another run)
+
+          Format as a clear, actionable summary.
+        output: "final_output"
+        timeout: 180
